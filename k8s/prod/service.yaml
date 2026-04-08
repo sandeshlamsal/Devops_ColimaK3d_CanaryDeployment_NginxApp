@@ -1,12 +1,27 @@
+# Argo Rollouts with Istio requires two distinct Services.
+# The controller patches selectors on these at runtime to point to the
+# stable and canary ReplicaSets respectively.
+---
 apiVersion: v1
 kind: Service
 metadata:
-  name: nginx
+  name: nginx-stable
   namespace: prod
 spec:
-  # Selector matches both stable and canary pods by app label.
-  # Argo Rollouts + Istio DestinationRule/VirtualService handle the
-  # actual traffic split — this Service is the single stable host entry.
+  selector:
+    app: nginx
+  ports:
+    - name: http
+      port: 80
+      targetPort: 80
+  type: ClusterIP
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: nginx-canary
+  namespace: prod
+spec:
   selector:
     app: nginx
   ports:

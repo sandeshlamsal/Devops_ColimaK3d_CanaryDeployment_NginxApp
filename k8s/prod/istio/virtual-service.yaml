@@ -10,7 +10,7 @@ spec:
     - "*"
   http:
     # --- Header-based canary override (QA internal testing) ---
-    # Requests with 'x-canary: true' always go to canary,
+    # Requests with 'x-canary: true' always go to canary service,
     # regardless of the current weight step.
     - match:
         - headers:
@@ -18,19 +18,24 @@ spec:
               exact: "true"
       route:
         - destination:
-            host: nginx
-            subset: canary
+            host: nginx-canary
+            port:
+              number: 80
           weight: 100
 
     # --- Weighted canary traffic split ---
     # Argo Rollouts controller updates these weights automatically at each step.
     # Initial state: 100% stable / 0% canary (before any rollout).
-    - route:
+    # The name 'primary' is referenced by the Rollout spec.
+    - name: primary
+      route:
         - destination:
-            host: nginx
-            subset: stable
+            host: nginx-stable
+            port:
+              number: 80
           weight: 100
         - destination:
-            host: nginx
-            subset: canary
+            host: nginx-canary
+            port:
+              number: 80
           weight: 0

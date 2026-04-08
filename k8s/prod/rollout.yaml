@@ -16,7 +16,8 @@ spec:
     spec:
       containers:
         - name: nginx
-          image: ghcr.io/sandeshlamsal/nginx-app:v1.0.0  # replaced by CI on each release
+          image: nginx-app:v1.0.0  # replaced by CI; for local testing use k3d image import
+          imagePullPolicy: Never    # use locally imported image in K3d
           ports:
             - containerPort: 80
           resources:
@@ -41,9 +42,11 @@ spec:
 
   strategy:
     canary:
-      # Argo Rollouts manages VirtualService weights via the Istio integration
-      canaryService: nginx          # same Service — subsets split by DestinationRule
-      stableService: nginx
+      # Argo Rollouts patches selectors on these two Services at runtime.
+      # nginx-stable → stable ReplicaSet pods
+      # nginx-canary → canary ReplicaSet pods
+      canaryService: nginx-canary
+      stableService: nginx-stable
       trafficRouting:
         istio:
           virtualService:
