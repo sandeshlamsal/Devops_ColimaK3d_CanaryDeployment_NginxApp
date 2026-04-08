@@ -25,6 +25,72 @@ This project demonstrates a complete multi-environment Kubernetes deployment wor
 
 ---
 
+## Cluster Sizing
+
+Nginx is a lightweight process (~5–15 MB RSS per worker). Sizes below are right-sized for a single Nginx app on a local Colima + K3d setup.
+
+### Dev
+
+Optimised for fast iteration — minimal footprint, single replica.
+
+| Property | Value |
+|----------|-------|
+| K3d nodes | 1 server |
+| Replicas | 1 |
+| CPU request / limit | `50m` / `100m` |
+| Memory request / limit | `32Mi` / `64Mi` |
+| Host port | `8080 → 80` |
+
+```bash
+k3d cluster create dev \
+  --servers 1 \
+  --port "8080:80@loadbalancer"
+```
+
+### QA
+
+Mirrors a lightweight production-like environment — two replicas to catch concurrency issues.
+
+| Property | Value |
+|----------|-------|
+| K3d nodes | 1 server + 1 agent |
+| Replicas | 2 |
+| CPU request / limit | `100m` / `200m` |
+| Memory request / limit | `64Mi` / `128Mi` |
+| Host port | `8081 → 80` |
+
+```bash
+k3d cluster create qa \
+  --servers 1 --agents 1 \
+  --port "8081:80@loadbalancer"
+```
+
+### Prod
+
+Sized for stable + canary workloads running side by side. The stable deployment holds 3 replicas; the canary holds 1, giving a natural 75/25 traffic split when both are live.
+
+| Property | Value |
+|----------|-------|
+| K3d nodes | 1 server + 2 agents |
+| Stable replicas | 3 |
+| Canary replicas | 1 |
+| CPU request / limit | `100m` / `500m` |
+| Memory request / limit | `64Mi` / `256Mi` |
+| Host port | `8082 → 80` |
+
+```bash
+k3d cluster create prod \
+  --servers 1 --agents 2 \
+  --port "8082:80@loadbalancer"
+```
+
+> **Colima host resources** — the three clusters together need roughly **4 vCPU** and **6 GB RAM** from Colima. Start Colima accordingly:
+> ```bash
+> colima start --cpu 4 --memory 6
+> ```
+
+---
+
 ## Versioning Strategy
 
 - **dev / qa** — Docker images are tagged with an environment prefix and the short Git commit SHA:
@@ -92,15 +158,26 @@ Production releases follow a canary pattern:
 ### 1. Start Colima
 
 ```bash
-colima start --cpu 4 --memory 8 --kubernetes
+colima start --cpu 4 --memory 6
 ```
 
 ### 2. Create Clusters
 
 ```bash
-k3d cluster create dev  --port "8080:80@loadbalancer"
-k3d cluster create qa   --port "8081:80@loadbalancer"
-k3d cluster create prod --port "8082:80@loadbalancer"
+# Dev — 1 server node
+k3d cluster create dev \
+  --servers 1 \
+  --port "8080:80@loadbalancer"
+
+# QA — 1 server + 1 agent
+k3d cluster create qa \
+  --servers 1 --agents 1 \
+  --port "8081:80@loadbalancer"
+
+# Prod — 1 server + 2 agents (supports stable + canary side by side)
+k3d cluster create prod \
+  --servers 1 --agents 2 \
+  --port "8082:80@loadbalancer"
 ```
 
 ### 3. Switch Context
