@@ -2,8 +2,8 @@
 # install-istio.sh — Installs Istio (minimal profile) on the prod K3d cluster.
 set -euo pipefail
 
-echo "==> Switching context to k3d-prod"
-kubectl config use-context k3d-prod
+echo "==> Switching context to k3d-prod-cluster"
+kubectl config use-context k3d-prod-cluster
 
 echo ""
 echo "==> Installing Istio (minimal profile)"

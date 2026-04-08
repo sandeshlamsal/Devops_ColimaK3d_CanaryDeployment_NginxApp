@@ -2,8 +2,8 @@
 # install-argo.sh — Installs Argo Rollouts controller and Prometheus on prod cluster.
 set -euo pipefail
 
-echo "==> Switching context to k3d-prod"
-kubectl config use-context k3d-prod
+echo "==> Switching context to k3d-prod-cluster"
+kubectl config use-context k3d-prod-cluster
 
 echo ""
 echo "==> Installing Argo Rollouts controller"

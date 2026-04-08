@@ -9,7 +9,7 @@ set -euo pipefail
 NAMESPACE=prod
 ROLLOUT=nginx
 
-kubectl config use-context k3d-prod
+kubectl config use-context k3d-prod-cluster
 
 ACTION=${1:-""}
 

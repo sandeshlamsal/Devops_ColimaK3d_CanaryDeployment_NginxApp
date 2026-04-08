@@ -6,6 +6,11 @@ set -euo pipefail
 echo "==> Starting Colima (4 vCPU / 6 GB RAM)"
 colima start --cpu 4 --memory 6 || echo "Colima already running — skipping"
 
+# NOTE: Colima's vz (Virtualization.Framework) driver uses an SSH mux to forward
+# cluster API ports to the Mac host. Port forwarding is established per-process
+# at startup. If you restart Colima, you must also restart all K3d clusters
+# so their ports are re-registered with the new SSH mux session.
+
 echo ""
 echo "==> Creating dev cluster (1 server, port 8080)"
 k3d cluster create dev \
@@ -33,4 +38,16 @@ echo "==> Cluster contexts:"
 kubectl config get-contexts | grep k3d
 
 echo ""
+echo "==> Verifying connectivity to all clusters"
+for cluster in dev qa prod; do
+  echo -n "    k3d-${cluster}: "
+  kubectl get nodes --context "k3d-${cluster}" --no-headers 2>&1 | awk '{print $1, $2}' | tr '\n' ' '
+  echo ""
+done
+
+echo ""
 echo "Done. Run scripts/install-istio.sh and scripts/install-argo.sh to set up the prod cluster."
+echo ""
+echo "IMPORTANT: If you restart Colima, run the following to restore all clusters:"
+echo "  k3d cluster start dev qa prod"
+echo "  # Then wait ~30s for K3s API to be ready"

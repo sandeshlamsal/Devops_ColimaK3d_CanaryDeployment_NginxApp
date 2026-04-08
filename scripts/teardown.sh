@@ -35,8 +35,8 @@ teardown_prod_workloads() {
     return
   fi
 
-  log "Switching to k3d-prod"
-  kubectl config use-context k3d-prod
+  log "Switching to k3d-prod-cluster"
+  kubectl config use-context k3d-prod-cluster
 
   log "Aborting any in-progress Argo Rollout"
   kubectl argo rollouts abort nginx -n prod 2>/dev/null || true
@@ -83,7 +83,7 @@ teardown_clusters() {
   done
 
   log "Removing stale kubectl contexts"
-  for ctx in k3d-dev k3d-qa k3d-prod; do
+  for ctx in k3d-dev k3d-dev-cluster k3d-qa k3d-qa-cluster k3d-prod-cluster; do
     if context_exists "$ctx"; then
       kubectl config delete-context "$ctx" 2>/dev/null && echo "    removed context: $ctx" || true
     fi
