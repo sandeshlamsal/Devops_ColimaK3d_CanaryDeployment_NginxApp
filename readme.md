@@ -323,6 +323,13 @@ kubectl argo rollouts set image nginx \
 
 `undo` re-runs the full canary progression with the previous stable image — it does not skip analysis steps.
 
+> **Proven locally on 2026-04-08:** After fully promoting v1.2.0 to stable, `kubectl argo rollouts undo nginx -n prod` triggered a new canary rollout with v1.1.0 as the canary and v1.2.0 remaining as stable. During the pause at 10% weight:
+> ```
+> curl http://prod.nginx.local:8082/version              # → v1.2.0  (stable, 90%)
+> curl -H "x-canary: true" .../version                  # → v1.1.0  (rollback target, 10%)
+> ```
+> After `promote --full`, prod returned to serving `v1.1.0` as the new stable. The rollback re-ran the full canary pipeline — analysis gates included.
+
 ---
 
 ### Scenario 4 — Emergency bypass (break-glass)
@@ -348,7 +355,7 @@ kubectl rollout status deployment/nginx -n prod
 |---|---|---|---|---|
 | SLO breach at canary step | AnalysisRun failure | Argo Rollouts aborts, resets weights | **Yes** | **Yes** — Issue 6 triggered automatic rollback before `or vector(0)` fix; VirtualService reset to stable=100% with no human action |
 | Human abort during canary | Operator decision | `kubectl argo rollouts abort nginx -n prod` | No | Not tested; mechanism is straightforward |
-| Bad full promotion | Post-deploy issue | `kubectl argo rollouts undo nginx -n prod` | No | Not tested locally; SHA-anchored tags (`v1.1.0-<sha>`) require CI push — local test used plain version tags |
+| Bad full promotion | Post-deploy issue | `kubectl argo rollouts undo nginx -n prod` | No | **Yes** — v1.2.0 promoted to stable, `undo` ran canary with v1.1.0; header routing confirmed split; full promotion restored v1.1.0 as stable |
 | Break-glass emergency | Rollouts unavailable | `kubectl set image` directly | No | Not tested; last-resort only |
 
 > **Tip:** Always confirm the running image after any rollback:
