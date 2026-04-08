@@ -817,6 +817,130 @@ prod:     Mac host → K3d serverlb → Istio IngressGateway → VirtualService 
 
 ---
 
+## Full End-to-End Test Record — All Green
+
+The following test sequence was executed on `2026-04-08` to confirm all three environments and the canary header routing are fully operational.
+
+---
+
+### Step 1 — Health check across all environments
+
+```bash
+curl http://dev.nginx.local:8080/healthz   # → ok
+curl http://qa.nginx.local:8081/healthz    # → ok
+curl http://prod.nginx.local:8082/healthz  # → ok
+```
+
+| Environment | Endpoint | Result |
+|---|---|---|
+| dev | `/healthz` | `200 ok` |
+| qa | `/healthz` | `200 ok` |
+| prod | `/healthz` | `200 ok` |
+
+---
+
+### Step 2 — Version endpoint across all environments
+
+```bash
+curl http://dev.nginx.local:8080/version   # → v1.0.0
+curl http://qa.nginx.local:8081/version    # → v1.0.0
+curl http://prod.nginx.local:8082/version  # → v1.1.0
+```
+
+| Environment | Endpoint | Version Returned |
+|---|---|---|
+| dev | `/version` | `v1.0.0` |
+| qa | `/version` | `v1.0.0` |
+| prod | `/version` | `v1.1.0` (previously promoted stable) |
+
+---
+
+### Step 3 — Trigger new canary rollout (v1.1.0 → v1.2.0)
+
+Built the v1.2.0 canary image using the canary HTML/config variant:
+
+```bash
+docker build --build-arg BUILD_ENV=canary --build-arg APP_VERSION=v1.2.0 \
+  -t nginx-app:v1.2.0 nginx/
+k3d image import nginx-app:v1.2.0 --cluster prod
+kubectl argo rollouts set image nginx nginx=nginx-app:v1.2.0 -n prod
+```
+
+Rollout paused at step 1 (weight=10%) as configured:
+
+```
+Name:     nginx
+Status:   ॥ Paused  (CanaryPauseStep)
+Step:     1/9
+Weight:   10% (ActualWeight: 10%)
+Images:   nginx-app:v1.1.0 (stable)
+          nginx-app:v1.2.0 (canary)
+Replicas: Desired=3  Current=4  Updated=1  Ready=4
+```
+
+Argo Rollouts patched service selectors at runtime:
+
+```
+nginx-stable → rollouts-pod-template-hash: 86b5bfcb7f  (v1.1.0 pods, 3 replicas)
+nginx-canary → rollouts-pod-template-hash: cf9649d5d   (v1.2.0 pod,  1 replica)
+```
+
+---
+
+### Step 4 — Canary header routing verification
+
+With the rollout paused at 10%, Istio's VirtualService routes `x-canary: true` directly to the canary service regardless of weight:
+
+```bash
+# Weight-based routing — hits stable (90% of traffic)
+curl http://prod.nginx.local:8082/version
+# → v1.1.0
+
+# Header-forced routing — always hits canary
+curl -H "x-canary: true" http://prod.nginx.local:8082/version
+# → v1.2.0
+```
+
+| Request | Header | Pod reached | Version |
+|---|---|---|---|
+| Normal | none | nginx-stable | `v1.1.0` |
+| Canary | `x-canary: true` | nginx-canary | `v1.2.0` |
+
+This confirms Istio's VirtualService header match is wired correctly and Argo Rollouts is managing the service selectors independently during the rollout.
+
+---
+
+### Step 5 — Full promotion to v1.2.0
+
+```bash
+kubectl argo rollouts promote nginx -n prod --full
+# → rollout 'nginx' fully promoted
+
+curl http://prod.nginx.local:8082/version
+# → v1.2.0
+```
+
+All traffic now serves v1.2.0 as stable. Canary pods scaled to 0.
+
+---
+
+### Final State — All Environments Green
+
+| Check | Command | Result |
+|---|---|---|
+| dev health | `curl dev.nginx.local:8080/healthz` | `200 ok` |
+| dev version | `curl dev.nginx.local:8080/version` | `v1.0.0` |
+| qa health | `curl qa.nginx.local:8081/healthz` | `200 ok` |
+| qa version | `curl qa.nginx.local:8081/version` | `v1.0.0` |
+| prod health | `curl prod.nginx.local:8082/healthz` | `200 ok` |
+| prod version (stable) | `curl prod.nginx.local:8082/version` | `v1.2.0` |
+| prod canary header | `curl -H "x-canary: true" .../version` | `v1.2.0` (same, post-promotion) |
+| Rollout status | `kubectl argo rollouts get rollout nginx -n prod` | `✔ Healthy` |
+| Canary pods | ReplicaSet scaled down | `0` canary pods |
+| Stable pods | All 3 running v1.2.0 | `3/3 Ready` |
+
+---
+
 ## Limitations & Enterprise Roadmap
 
 This project is a local learning environment. The table below maps each limitation to the enterprise-grade alternative.
