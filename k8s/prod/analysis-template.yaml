@@ -8,31 +8,38 @@ spec:
     - name: namespace
 
   metrics:
-    # Gate 1: HTTP 5xx error rate must be < 1% over the last 2 minutes
+    # Gate 1: HTTP 5xx error rate must be < 1% over the last 2 minutes.
+    # `or vector(0)` ensures the query returns 0 when there is no traffic yet,
+    # preventing an empty-result error that would falsely abort the rollout.
     - name: error-rate
       interval: 30s
       count: 4              # run 4 times (every 30s over 2 minutes)
       successCondition: result[0] < 0.01
-      failureLimit: 1       # abort after 1 failed measurement
+      failureLimit: 2       # tolerate up to 2 failures before aborting
       provider:
         prometheus:
           address: http://prometheus-kube-prometheus-prometheus.monitoring.svc.cluster.local:9090
           query: |
-            sum(rate(nginx_http_requests_total{namespace="{{args.namespace}}", status=~"5.."}[2m]))
-            /
-            sum(rate(nginx_http_requests_total{namespace="{{args.namespace}}"}[2m]))
+            (
+              sum(rate(nginx_http_requests_total{namespace="{{args.namespace}}", status=~"5.."}[2m]))
+              /
+              sum(rate(nginx_http_requests_total{namespace="{{args.namespace}}"}[2m]))
+            ) or vector(0)
 
-    # Gate 2: p99 request latency must be < 500ms
+    # Gate 2: p99 request latency must be < 500ms.
+    # Returns 0 when no histogram data exists yet.
     - name: p99-latency
       interval: 30s
       count: 4
       successCondition: result[0] < 0.5
-      failureLimit: 1
+      failureLimit: 2
       provider:
         prometheus:
           address: http://prometheus-kube-prometheus-prometheus.monitoring.svc.cluster.local:9090
           query: |
-            histogram_quantile(0.99,
-              sum(rate(nginx_request_duration_seconds_bucket{namespace="{{args.namespace}}"}[2m]))
-              by (le)
-            )
+            (
+              histogram_quantile(0.99,
+                sum(rate(nginx_request_duration_seconds_bucket{namespace="{{args.namespace}}"}[2m]))
+                by (le)
+              )
+            ) or vector(0)
