@@ -933,6 +933,8 @@ All traffic now serves v1.2.0 as stable. Canary pods scaled to 0.
 
 ### Final State — All Environments Green
 
+Verified on `2026-04-08` after canary promotion (v1.0.0 → v1.1.0 → v1.2.0) and rollback (v1.2.0 → v1.1.0 via `undo`):
+
 | Check | Command | Result |
 |---|---|---|
 | dev health | `curl dev.nginx.local:8080/healthz` | `200 ok` |
@@ -940,11 +942,10 @@ All traffic now serves v1.2.0 as stable. Canary pods scaled to 0.
 | qa health | `curl qa.nginx.local:8081/healthz` | `200 ok` |
 | qa version | `curl qa.nginx.local:8081/version` | `v1.0.0` |
 | prod health | `curl prod.nginx.local:8082/healthz` | `200 ok` |
-| prod version (stable) | `curl prod.nginx.local:8082/version` | `v1.2.0` |
-| prod canary header | `curl -H "x-canary: true" .../version` | `v1.2.0` (same, post-promotion) |
-| Rollout status | `kubectl argo rollouts get rollout nginx -n prod` | `✔ Healthy` |
+| prod version (stable) | `curl prod.nginx.local:8082/version` | `v1.1.0` (post-rollback from v1.2.0) |
+| Rollout status | `kubectl argo rollouts get rollout nginx -n prod` | `✔ Healthy` — Step 9/9, weight 100% |
 | Canary pods | ReplicaSet scaled down | `0` canary pods |
-| Stable pods | All 3 running v1.2.0 | `3/3 Ready` |
+| Stable pods | All 3 running v1.1.0 | `3/3 Ready` |
 
 ---
 
