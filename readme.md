@@ -123,12 +123,144 @@ k3d cluster create prod \
 
 ## Canary Deployment Strategy
 
-Production releases follow a canary pattern:
+There are three mainstream approaches to canary deployments. Each has a different trade-off between simplicity and precision.
 
-1. Deploy the new version alongside the stable version
-2. Route a small percentage of traffic (e.g., 25%) to the canary via replica ratio (1 canary / 3 stable)
-3. Monitor metrics and health checks
-4. Promote canary to stable or roll back if issues are detected
+---
+
+### Approach 1 — Replica Ratio (Naive)
+
+Traffic is split by running fewer canary pods alongside stable pods. With 3 stable + 1 canary replicas, ~25% of requests land on the canary.
+
+```
+┌──────────────┐     kube-proxy (round-robin)
+│   Ingress    │ ──────────────────────────────┐
+└──────────────┘                               │
+                                  ┌────────────▼────────────┐
+                                  │  Service: nginx          │
+                                  └──────┬──────────┬────────┘
+                               75%       │          │  25%
+                        ┌────────────────▼┐  ┌──────▼────────┐
+                        │ stable (3 pods) │  │ canary (1 pod)│
+                        └─────────────────┘  └───────────────┘
+```
+
+**Flow:**
+1. Deploy canary alongside stable
+2. kube-proxy naturally load-balances across all 4 pods
+3. Monitor manually; delete canary deployment to roll back
+
+| | |
+|---|---|
+| Pros | No extra tooling; simple to understand |
+| Cons | Traffic % is tied to replica count — can't do 5% or 1% without many replicas; breaks with session affinity; no metric-based automation |
+
+---
+
+### Approach 2 — Istio VirtualService Weighted Routing ✅ Used in this project
+
+Istio's Envoy sidecar intercepts all traffic and routes by explicit percentage at the L7 layer, completely independent of replica count.
+
+```
+┌──────────────┐
+│   Gateway    │  (Istio IngressGateway)
+└──────┬───────┘
+       │
+┌──────▼───────────────────────────────┐
+│  VirtualService: nginx               │
+│  route:                              │
+│    - destination: stable  weight: 90 │
+│    - destination: canary  weight: 10 │
+└──────┬──────────────────────┬────────┘
+       │ 90%                  │ 10%
+┌──────▼──────────┐   ┌───────▼──────────┐
+│  DestinationRule│   │  DestinationRule  │
+│  subset: stable │   │  subset: canary   │
+│  (version=stable│   │  (version=canary) │
+│   3 pods)       │   │   1 pod)          │
+└─────────────────┘   └──────────────────┘
+```
+
+**Flow:**
+1. Istio Gateway receives external traffic
+2. VirtualService applies weighted routing (90% stable / 10% canary)
+3. DestinationRule maps subsets to pods via `version` label
+4. Weights are adjusted in Git (e.g. 90/10 → 50/50 → 0/100) to promote
+5. Canary deployment is deleted after full promotion
+
+Supports optional header-based routing — route only requests with `x-canary: true` to the canary, letting QA validate before any real user traffic is shifted:
+
+```yaml
+- match:
+    - headers:
+        x-canary:
+          exact: "true"
+  route:
+    - destination:
+        host: nginx
+        subset: canary
+```
+
+| | |
+|---|---|
+| Pros | Precise % independent of replica count; header-based routing for internal testing; foundation for automated promotion; L7 observability via Envoy |
+| Cons | Adds Istio overhead (~50 Mi RAM per pod sidecar); more setup required |
+
+---
+
+### Approach 3 — Argo Rollouts + Istio (Enterprise / Automated)
+
+Builds on top of Istio but replaces manual weight adjustment with automated, metric-gated progressive delivery. Argo Rollouts controls the `VirtualService` weights automatically.
+
+```
+┌─────────────────────────────────────────────────┐
+│  Argo Rollouts Controller                        │
+│                                                  │
+│  Step 1: set canary weight = 5%  → query metrics │
+│  Step 2: set canary weight = 20% → query metrics │
+│  Step 3: set canary weight = 50% → query metrics │
+│  Step 4: promote to 100% OR rollback             │
+└──────────────────────┬──────────────────────────┘
+                       │ updates weights
+               ┌───────▼────────┐
+               │ VirtualService  │  (Istio)
+               └───────┬────────┘
+                        │
+              ┌─────────┴──────────┐
+         90-5%│                    │ 10-95%
+      ┌────────▼──────┐    ┌───────▼────────┐
+      │ stable pods   │    │ canary pods    │
+      └───────────────┘    └────────────────┘
+                       ↑
+             Prometheus metrics feed
+             rollback gate (error rate,
+             p99 latency thresholds)
+```
+
+**Flow:**
+1. Push a new image tag → Argo Rollouts starts the progressive steps
+2. At each step, Rollouts queries Prometheus for SLO metrics
+3. If metrics breach thresholds → automatic rollback, no human needed
+4. If all steps pass → full promotion, stable deployment updated
+
+| | |
+|---|---|
+| Pros | Fully automated; SLO-gated promotion; integrates with ArgoCD for GitOps; no manual weight changes |
+| Cons | Requires Prometheus + Argo Rollouts + Istio; highest operational complexity |
+
+---
+
+### Comparison Summary
+
+| | Replica Ratio | **Istio VirtualService** | Argo Rollouts + Istio |
+|---|---|---|---|
+| Traffic precision | Coarse (tied to replicas) | **Exact %** | **Exact %** |
+| Extra tooling | None | Istio | Istio + Argo Rollouts + Prometheus |
+| Rollback | Manual | Manual (delete canary) | **Automatic (metric-gated)** |
+| Header-based routing | No | **Yes** | **Yes** |
+| Production-ready | No | Yes | **Yes (enterprise)** |
+| Used in this project | No | **Yes** | Future roadmap |
+
+> **This project uses Approach 2 — Istio VirtualService weighted routing.** It gives precise, configurable traffic splitting with header-based testing support, and serves as the foundation for graduating to Argo Rollouts when metric automation is needed.
 
 ---
 
