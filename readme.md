@@ -10,7 +10,7 @@ This project demonstrates a complete multi-environment Kubernetes deployment wor
 
 - **Local Kubernetes clusters** via Colima + K3d (no cloud required)
 - **Canary deployments** to safely roll out changes with controlled traffic splitting
-- **Environment-specific versioning** — SHA-based tags for dev/qa, semantic versions for prod
+- **Environment-specific versioning** — SHA-based tags for dev/qa, dual semver + SHA tags for prod
 - **GitHub Actions CI/CD** to automate build, tag, and deploy across all environments
 
 ---
@@ -21,7 +21,7 @@ This project demonstrates a complete multi-environment Kubernetes deployment wor
 |---------|---------|-----------------|
 | `dev` | Active development, continuous integration | `dev-<git-sha>` |
 | `qa` | Staging and validation | `qa-<git-sha>` |
-| `prod` | Production traffic with canary rollout | `v1.2.3` (semantic version) |
+| `prod` | Production traffic with canary rollout | `v1.2.3` + `v1.2.3-<git-sha>` |
 
 ---
 
@@ -93,15 +93,31 @@ k3d cluster create prod \
 
 ## Versioning Strategy
 
-- **dev / qa** — Docker images are tagged with an environment prefix and the short Git commit SHA:
+- **dev / qa** — Images are tagged with an environment prefix and the short Git commit SHA:
   ```
   ghcr.io/<owner>/nginx-app:dev-a1b2c3d
   ghcr.io/<owner>/nginx-app:qa-a1b2c3d
   ```
-- **prod** — Images are tagged with a semantic release version, triggered by a Git tag push:
+
+- **prod** — Every image receives **two tags** pushed together: a human-readable semantic version and a SHA-anchored traceability tag. Both tags point to the exact same image digest.
   ```
-  ghcr.io/<owner>/nginx-app:v1.2.3
+  ghcr.io/<owner>/nginx-app:v1.2.3          # semantic — used in k8s manifests
+  ghcr.io/<owner>/nginx-app:v1.2.3-a1b2c3d  # semver + SHA — traceability anchor
   ```
+
+  The SHA tag lets you answer "which commit is running in prod?" without querying the registry manifest, and gives you an exact pull target for rollbacks.
+
+  In the GitHub Actions release workflow:
+  ```yaml
+  - name: Build and push
+    uses: docker/build-push-action@v5
+    with:
+      tags: |
+        ghcr.io/${{ github.repository }}:${{ github.ref_name }}
+        ghcr.io/${{ github.repository }}:${{ github.ref_name }}-${{ github.sha }}
+  ```
+
+  The Kubernetes deployment uses the stable semver tag (`v1.2.3`). The SHA tag is recorded in the GitHub Release notes and deployment annotations for full traceability.
 
 ---
 
@@ -110,10 +126,89 @@ k3d cluster create prod \
 Production releases follow a canary pattern:
 
 1. Deploy the new version alongside the stable version
-2. Route a small percentage of traffic (e.g., 10–20%) to the canary
+2. Route a small percentage of traffic (e.g., 25%) to the canary via replica ratio (1 canary / 3 stable)
 3. Monitor metrics and health checks
-4. Gradually shift traffic or roll back if issues are detected
-5. Promote canary to stable once validated
+4. Promote canary to stable or roll back if issues are detected
+
+---
+
+## Rollback Strategy
+
+Rollback decisions are based on the severity and timing of the issue detected.
+
+### Scenario 1 — Issue detected during canary phase
+
+The canary is still live alongside the stable deployment. Stable pods are unaffected.
+
+```bash
+# Delete the canary deployment — traffic falls back to stable immediately
+kubectl delete deployment nginx-canary -n prod
+```
+
+No image change is needed; stable was never replaced.
+
+---
+
+### Scenario 2 — Issue detected after full promotion
+
+The canary has been promoted and all replicas run the new (bad) version. Roll back to the previous known-good semver image.
+
+```bash
+# Identify the previous good version from the image tag or release notes
+PREVIOUS=v1.2.2
+
+kubectl set image deployment/nginx-stable \
+  nginx=ghcr.io/<owner>/nginx-app:${PREVIOUS} \
+  -n prod
+
+kubectl rollout status deployment/nginx-stable -n prod
+```
+
+The SHA-anchored tag (`v1.2.2-a1b2c3d`) confirms you are pulling exactly the right image:
+```bash
+kubectl set image deployment/nginx-stable \
+  nginx=ghcr.io/<owner>/nginx-app:v1.2.2-a1b2c3d \
+  -n prod
+```
+
+---
+
+### Scenario 3 — Emergency: automated rollback via GitHub Actions
+
+The prod workflow can trigger a rollback job on failure. It reads the last successful release tag from the GitHub API and re-deploys it:
+
+```yaml
+rollback:
+  if: failure()
+  runs-on: ubuntu-latest
+  steps:
+    - name: Get last stable release
+      id: prev
+      run: |
+        TAG=$(gh release list --limit 2 --json tagName -q '.[1].tagName')
+        echo "tag=$TAG" >> $GITHUB_OUTPUT
+
+    - name: Roll back deployment
+      run: |
+        kubectl set image deployment/nginx-stable \
+          nginx=ghcr.io/${{ github.repository }}:${{ steps.prev.outputs.tag }} \
+          -n prod
+```
+
+---
+
+### Rollback Decision Matrix
+
+| When detected | Action | Command |
+|---------------|--------|---------|
+| Canary still live | Delete canary deployment | `kubectl delete deployment nginx-canary -n prod` |
+| After full promotion | `kubectl set image` to previous semver | `kubectl set image deployment/nginx-stable nginx=...:v1.2.2 -n prod` |
+| Automated (CI failure) | GitHub Actions rollback job | Triggered automatically on workflow failure |
+
+> **Tip:** Always verify the rollback with `kubectl rollout status` and confirm the running image with:
+> ```bash
+> kubectl get pods -n prod -o jsonpath='{.items[*].spec.containers[*].image}'
+> ```
 
 ---
 
