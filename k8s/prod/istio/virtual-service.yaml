@@ -1,0 +1,36 @@
+apiVersion: networking.istio.io/v1beta1
+kind: VirtualService
+metadata:
+  name: nginx
+  namespace: prod
+spec:
+  gateways:
+    - nginx-gateway
+  hosts:
+    - "*"
+  http:
+    # --- Header-based canary override (QA internal testing) ---
+    # Requests with 'x-canary: true' always go to canary,
+    # regardless of the current weight step.
+    - match:
+        - headers:
+            x-canary:
+              exact: "true"
+      route:
+        - destination:
+            host: nginx
+            subset: canary
+          weight: 100
+
+    # --- Weighted canary traffic split ---
+    # Argo Rollouts controller updates these weights automatically at each step.
+    # Initial state: 100% stable / 0% canary (before any rollout).
+    - route:
+        - destination:
+            host: nginx
+            subset: stable
+          weight: 100
+        - destination:
+            host: nginx
+            subset: canary
+          weight: 0

@@ -1,0 +1,64 @@
+name: QA — Build & Deploy
+
+on:
+  pull_request:
+    types:
+      - closed
+    branches:
+      - main
+  workflow_dispatch:
+    inputs:
+      image_tag:
+        description: "Dev image SHA tag to promote (e.g. dev-a1b2c3d)"
+        required: true
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE: ghcr.io/${{ github.repository_owner }}/nginx-app
+
+jobs:
+  deploy-qa:
+    if: github.event.pull_request.merged == true || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Resolve image tag
+        id: tag
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "value=${{ inputs.image_tag }}" >> $GITHUB_OUTPUT
+          else
+            echo "value=dev-$(git rev-parse --short HEAD)" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Retag dev image as qa
+        run: |
+          docker pull ${{ env.IMAGE }}:${{ steps.tag.outputs.value }}
+          docker tag  ${{ env.IMAGE }}:${{ steps.tag.outputs.value }} \
+                      ${{ env.IMAGE }}:qa-$(git rev-parse --short HEAD)
+          docker push ${{ env.IMAGE }}:qa-$(git rev-parse --short HEAD)
+
+      - name: Deploy to qa cluster
+        uses: tale/kubectl-action@v1
+        with:
+          base64-kube-config: ${{ secrets.KUBECONFIG_QA_B64 }}
+        run: |
+          kubectl apply -f k8s/qa/namespace.yaml
+          kubectl set image deployment/nginx \
+            nginx=${{ env.IMAGE }}:qa-$(git rev-parse --short HEAD) \
+            -n qa
+          kubectl apply -f k8s/qa/deployment.yaml
+          kubectl rollout status deployment/nginx -n qa --timeout=120s

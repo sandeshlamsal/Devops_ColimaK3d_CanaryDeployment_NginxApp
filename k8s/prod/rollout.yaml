@@ -1,0 +1,84 @@
+apiVersion: argoproj.io/v1alpha1
+kind: Rollout
+metadata:
+  name: nginx
+  namespace: prod
+spec:
+  replicas: 3
+  revisionHistoryLimit: 3
+  selector:
+    matchLabels:
+      app: nginx
+  template:
+    metadata:
+      labels:
+        app: nginx
+    spec:
+      containers:
+        - name: nginx
+          image: ghcr.io/sandeshlamsal/nginx-app:v1.0.0  # replaced by CI on each release
+          ports:
+            - containerPort: 80
+          resources:
+            requests:
+              cpu: "100m"
+              memory: "64Mi"
+            limits:
+              cpu: "500m"
+              memory: "256Mi"
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: 80
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: 80
+            initialDelaySeconds: 3
+            periodSeconds: 5
+
+  strategy:
+    canary:
+      # Argo Rollouts manages VirtualService weights via the Istio integration
+      canaryService: nginx          # same Service — subsets split by DestinationRule
+      stableService: nginx
+      trafficRouting:
+        istio:
+          virtualService:
+            name: nginx
+            routes:
+              - primary             # matches the weighted route block in virtual-service.yaml
+
+      # Progressive canary steps with Prometheus analysis at each pause
+      steps:
+        - setWeight: 10
+        - pause: {duration: 1m}
+        - analysis:
+            templates:
+              - templateName: nginx-error-rate
+            args:
+              - name: namespace
+                value: prod
+
+        - setWeight: 30
+        - pause: {duration: 2m}
+        - analysis:
+            templates:
+              - templateName: nginx-error-rate
+            args:
+              - name: namespace
+                value: prod
+
+        - setWeight: 60
+        - pause: {duration: 2m}
+        - analysis:
+            templates:
+              - templateName: nginx-error-rate
+            args:
+              - name: namespace
+                value: prod
+
+        # Final step: full promotion — Argo Rollouts sets weight to 100%
+        # and scales canary pods to 0 automatically

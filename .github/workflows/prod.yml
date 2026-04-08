@@ -1,0 +1,118 @@
+name: Prod — Canary Release (Argo Rollouts)
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE: ghcr.io/${{ github.repository_owner }}/nginx-app
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    outputs:
+      semver: ${{ steps.meta.outputs.semver }}
+      sha_tag: ${{ steps.meta.outputs.sha_tag }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Resolve tags
+        id: meta
+        run: |
+          SEMVER=${GITHUB_REF_NAME}                          # e.g. v1.2.3
+          SHA=$(git rev-parse --short HEAD)
+          SHA_TAG="${SEMVER}-${SHA}"                         # e.g. v1.2.3-a1b2c3d
+          echo "semver=${SEMVER}"   >> $GITHUB_OUTPUT
+          echo "sha_tag=${SHA_TAG}" >> $GITHUB_OUTPUT
+
+      - name: Build and push — stable image with dual tags
+        uses: docker/build-push-action@v5
+        with:
+          context: ./nginx
+          push: true
+          build-args: |
+            BUILD_ENV=stable
+            APP_VERSION=${{ steps.meta.outputs.semver }}
+          tags: |
+            ${{ env.IMAGE }}:${{ steps.meta.outputs.semver }}
+            ${{ env.IMAGE }}:${{ steps.meta.outputs.sha_tag }}
+
+  canary-rollout:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configure kubectl (prod cluster)
+        uses: tale/kubectl-action@v1
+        with:
+          base64-kube-config: ${{ secrets.KUBECONFIG_PROD_B64 }}
+
+      - name: Apply prod base manifests (idempotent)
+        run: |
+          kubectl apply -f k8s/prod/namespace.yaml
+          kubectl apply -f k8s/prod/service.yaml
+          kubectl apply -f k8s/prod/istio/
+          kubectl apply -f k8s/prod/analysis-template.yaml
+          kubectl apply -f k8s/prod/prometheus-servicemonitor.yaml
+
+      - name: Apply Rollout resource (first-time or update)
+        run: kubectl apply -f k8s/prod/rollout.yaml
+
+      - name: Trigger canary — update image to ${{ needs.build.outputs.semver }}
+        run: |
+          kubectl argo rollouts set image nginx \
+            nginx=${{ env.IMAGE }}:${{ needs.build.outputs.semver }} \
+            -n prod
+
+      - name: Watch rollout progress
+        # Blocks until rollout completes or fails (respects --timeout).
+        # Argo Rollouts runs AnalysisRuns in the background at each pause step.
+        run: |
+          kubectl argo rollouts status nginx -n prod --timeout 15m
+
+      - name: Annotate GitHub Release with image tags
+        if: success()
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release edit ${{ needs.build.outputs.semver }} \
+            --notes "**Deployed images:**
+          - \`${{ env.IMAGE }}:${{ needs.build.outputs.semver }}\`
+          - \`${{ env.IMAGE }}:${{ needs.build.outputs.sha_tag }}\` (traceability anchor)"
+
+  rollback-on-failure:
+    needs: canary-rollout
+    if: failure()
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Configure kubectl (prod cluster)
+        uses: tale/kubectl-action@v1
+        with:
+          base64-kube-config: ${{ secrets.KUBECONFIG_PROD_B64 }}
+
+      - name: Abort canary (Argo Rollouts resets weights to stable=100%)
+        run: kubectl argo rollouts abort nginx -n prod
+
+      - name: Notify rollback
+        run: |
+          echo "::error::Canary rollout failed for ${{ needs.build.outputs.semver }}. Argo Rollouts has aborted and traffic restored to stable."

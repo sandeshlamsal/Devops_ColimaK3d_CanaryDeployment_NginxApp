@@ -1,0 +1,20 @@
+apiVersion: networking.istio.io/v1beta1
+kind: DestinationRule
+metadata:
+  name: nginx
+  namespace: prod
+spec:
+  host: nginx
+  # Argo Rollouts requires trafficPolicy at subset level for canary weight management
+  trafficPolicy:
+    tls:
+      mode: DISABLE   # plain HTTP inside the mesh (no mTLS between nginx pods)
+  subsets:
+    - name: stable
+      labels:
+        # Argo Rollouts sets this label on stable ReplicaSet pods automatically
+        rollouts-pod-template-hash: ""   # placeholder — managed by Argo Rollouts
+    - name: canary
+      labels:
+        # Argo Rollouts sets this label on canary ReplicaSet pods automatically
+        rollouts-pod-template-hash: ""   # placeholder — managed by Argo Rollouts

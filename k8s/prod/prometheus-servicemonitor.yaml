@@ -1,0 +1,70 @@
+---
+# nginx-prometheus-exporter sidecar — scrapes nginx stub_status and
+# exposes Prometheus metrics on port 9113.
+# Added as an extra container in the Rollout pod template via a separate patch,
+# or run as a standalone DaemonSet for simplicity in local K3d testing.
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: nginx-exporter
+  namespace: prod
+spec:
+  selector:
+    matchLabels:
+      app: nginx-exporter
+  template:
+    metadata:
+      labels:
+        app: nginx-exporter
+    spec:
+      containers:
+        - name: nginx-exporter
+          image: nginx/nginx-prometheus-exporter:1.1.0
+          args:
+            - --nginx.scrape-uri=http://nginx.prod.svc.cluster.local/stub_status
+          ports:
+            - containerPort: 9113
+              name: metrics
+          resources:
+            requests:
+              cpu: "10m"
+              memory: "16Mi"
+            limits:
+              cpu: "50m"
+              memory: "32Mi"
+---
+# ServiceMonitor tells Prometheus (kube-prometheus-stack) to scrape the exporter
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: nginx
+  namespace: prod
+  labels:
+    release: prometheus    # must match kube-prometheus-stack Helm release name
+spec:
+  namespaceSelector:
+    matchNames:
+      - prod
+  selector:
+    matchLabels:
+      app: nginx-exporter
+  endpoints:
+    - port: metrics
+      interval: 15s
+      path: /metrics
+---
+# Expose the exporter as a Service so Prometheus can scrape it
+apiVersion: v1
+kind: Service
+metadata:
+  name: nginx-exporter
+  namespace: prod
+  labels:
+    app: nginx-exporter
+spec:
+  selector:
+    app: nginx-exporter
+  ports:
+    - name: metrics
+      port: 9113
+      targetPort: 9113

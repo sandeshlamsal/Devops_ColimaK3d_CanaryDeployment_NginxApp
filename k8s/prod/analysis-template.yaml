@@ -1,0 +1,38 @@
+apiVersion: argoproj.io/v1alpha1
+kind: AnalysisTemplate
+metadata:
+  name: nginx-error-rate
+  namespace: prod
+spec:
+  args:
+    - name: namespace
+
+  metrics:
+    # Gate 1: HTTP 5xx error rate must be < 1% over the last 2 minutes
+    - name: error-rate
+      interval: 30s
+      count: 4              # run 4 times (every 30s over 2 minutes)
+      successCondition: result[0] < 0.01
+      failureLimit: 1       # abort after 1 failed measurement
+      provider:
+        prometheus:
+          address: http://prometheus-kube-prometheus-prometheus.monitoring.svc.cluster.local:9090
+          query: |
+            sum(rate(nginx_http_requests_total{namespace="{{args.namespace}}", status=~"5.."}[2m]))
+            /
+            sum(rate(nginx_http_requests_total{namespace="{{args.namespace}}"}[2m]))
+
+    # Gate 2: p99 request latency must be < 500ms
+    - name: p99-latency
+      interval: 30s
+      count: 4
+      successCondition: result[0] < 0.5
+      failureLimit: 1
+      provider:
+        prometheus:
+          address: http://prometheus-kube-prometheus-prometheus.monitoring.svc.cluster.local:9090
+          query: |
+            histogram_quantile(0.99,
+              sum(rate(nginx_request_duration_seconds_bucket{namespace="{{args.namespace}}"}[2m]))
+              by (le)
+            )
