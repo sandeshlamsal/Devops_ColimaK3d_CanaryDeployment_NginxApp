@@ -1,6 +1,6 @@
 # Canary Deployment with Colima, K3d & Nginx
 
-A GitOps-style canary deployment pipeline for an Nginx application across three Kubernetes clusters (dev, qa, prod) using [Colima](https://github.com/abiosoft/colima) and [K3d](https://k3d.io), orchestrated via GitHub Actions.
+A GitOps-style canary deployment pipeline for an Nginx application across three Kubernetes clusters (dev, qa, prod) using [Colima](https://github.com/abiosoft/colima) and [K3d](https://k3d.io), with **Argo Rollouts + Istio** for SLO-gated progressive delivery, orchestrated via GitHub Actions.
 
 ---
 
@@ -9,9 +9,10 @@ A GitOps-style canary deployment pipeline for an Nginx application across three 
 This project demonstrates a complete multi-environment Kubernetes deployment workflow with:
 
 - **Local Kubernetes clusters** via Colima + K3d (no cloud required)
-- **Canary deployments** to safely roll out changes with controlled traffic splitting
+- **SLO-gated canary delivery** via Argo Rollouts + Istio — automatic promotion or rollback based on Prometheus metrics
 - **Environment-specific versioning** — SHA-based tags for dev/qa, dual semver + SHA tags for prod
 - **GitHub Actions CI/CD** to automate build, tag, and deploy across all environments
+- **Prometheus** feeds error rate and p99 latency metrics into every canary step gate
 
 ---
 
@@ -67,24 +68,29 @@ k3d cluster create qa \
 
 ### Prod
 
-Sized for stable + canary workloads running side by side. The stable deployment holds 3 replicas; the canary holds 1, giving a natural 75/25 traffic split when both are live.
+Sized for Argo Rollouts + Istio + Prometheus running alongside the nginx workload. Argo Rollouts manages replica scaling automatically during canary steps — you do not set canary replica count manually.
 
 | Property | Value |
 |----------|-------|
 | K3d nodes | 1 server + 2 agents |
-| Stable replicas | 3 |
-| Canary replicas | 1 |
-| CPU request / limit | `100m` / `500m` |
-| Memory request / limit | `64Mi` / `256Mi` |
-| Host port | `8082 → 80` |
+| Nginx stable replicas | 3 (managed by Argo Rollouts) |
+| Nginx canary replicas | 1 (scaled by Argo Rollouts per step) |
+| Nginx CPU request / limit | `100m` / `500m` |
+| Nginx memory request / limit | `64Mi` / `256Mi` |
+| Istio sidecar overhead | ~50 Mi RAM per pod |
+| Prometheus + Grafana overhead | ~300 Mi RAM total |
+| Host port | `8082 → 80` (Istio IngressGateway) |
 
 ```bash
 k3d cluster create prod \
   --servers 1 --agents 2 \
-  --port "8082:80@loadbalancer"
+  --port "8082:80@loadbalancer" \
+  --k3s-arg "--disable=traefik@server:0"
 ```
 
-> **Colima host resources** — the three clusters together need roughly **4 vCPU** and **6 GB RAM** from Colima. Start Colima accordingly:
+> `--disable=traefik` is required — Traefik conflicts with the Istio IngressGateway on port 80.
+
+> **Colima host resources** — Istio sidecars + Prometheus push total requirements to ~**4 vCPU / 6 GB RAM**:
 > ```bash
 > colima start --cpu 4 --memory 6
 > ```
@@ -156,7 +162,7 @@ Traffic is split by running fewer canary pods alongside stable pods. With 3 stab
 
 ---
 
-### Approach 2 — Istio VirtualService Weighted Routing ✅ Used in this project
+### Approach 2 — Istio VirtualService Weighted Routing
 
 Istio's Envoy sidecar intercepts all traffic and routes by explicit percentage at the L7 layer, completely independent of replica count.
 
@@ -207,7 +213,7 @@ Supports optional header-based routing — route only requests with `x-canary: t
 
 ---
 
-### Approach 3 — Argo Rollouts + Istio (Enterprise / Automated)
+### Approach 3 — Argo Rollouts + Istio (Enterprise / Automated) ✅ Used in this project
 
 Builds on top of Istio but replaces manual weight adjustment with automated, metric-gated progressive delivery. Argo Rollouts controls the `VirtualService` weights automatically.
 
@@ -251,94 +257,103 @@ Builds on top of Istio but replaces manual weight adjustment with automated, met
 
 ### Comparison Summary
 
-| | Replica Ratio | **Istio VirtualService** | Argo Rollouts + Istio |
+| | Replica Ratio | Istio VirtualService | **Argo Rollouts + Istio** |
 |---|---|---|---|
-| Traffic precision | Coarse (tied to replicas) | **Exact %** | **Exact %** |
-| Extra tooling | None | Istio | Istio + Argo Rollouts + Prometheus |
+| Traffic precision | Coarse (tied to replicas) | Exact % | **Exact %** |
+| Extra tooling | None | Istio | **Istio + Argo Rollouts + Prometheus** |
 | Rollback | Manual | Manual (delete canary) | **Automatic (metric-gated)** |
-| Header-based routing | No | **Yes** | **Yes** |
+| Header-based routing | No | Yes | **Yes** |
+| SLO-gated promotion | No | No | **Yes** |
 | Production-ready | No | Yes | **Yes (enterprise)** |
-| Used in this project | No | **Yes** | Future roadmap |
+| Used in this project | No | No | **Yes** |
 
-> **This project uses Approach 2 — Istio VirtualService weighted routing.** It gives precise, configurable traffic splitting with header-based testing support, and serves as the foundation for graduating to Argo Rollouts when metric automation is needed.
+> **This project uses Approach 3 — Argo Rollouts + Istio.** Argo Rollouts controls VirtualService weights automatically across progressive steps (10% → 30% → 60% → 100%), querying Prometheus at each step. If error rate or p99 latency breaches the threshold, rollback is triggered with no human intervention.
 
 ---
 
 ## Rollback Strategy
 
-Rollback decisions are based on the severity and timing of the issue detected.
-
-### Scenario 1 — Issue detected during canary phase
-
-The canary is still live alongside the stable deployment. Stable pods are unaffected.
-
-```bash
-# Delete the canary deployment — traffic falls back to stable immediately
-kubectl delete deployment nginx-canary -n prod
-```
-
-No image change is needed; stable was never replaced.
+With Argo Rollouts, most rollbacks are **automatic**. The table below covers all scenarios from fully automated to last-resort manual.
 
 ---
 
-### Scenario 2 — Issue detected after full promotion
+### Scenario 1 — Automatic rollback (SLO breach during canary step)
 
-The canary has been promoted and all replicas run the new (bad) version. Roll back to the previous known-good semver image.
+Argo Rollouts queries Prometheus at each step. If the `AnalysisRun` fails (error rate ≥ 1% or p99 > 500 ms), Rollouts aborts the canary and restores 100% traffic to stable — no human action needed.
 
-```bash
-# Identify the previous good version from the image tag or release notes
-PREVIOUS=v1.2.2
-
-kubectl set image deployment/nginx-stable \
-  nginx=ghcr.io/<owner>/nginx-app:${PREVIOUS} \
-  -n prod
-
-kubectl rollout status deployment/nginx-stable -n prod
+```
+Step 1: weight=10% → AnalysisRun: FAIL (error rate 3%)
+        → Argo Rollouts aborts canary
+        → VirtualService: stable=100%, canary=0%
+        → canary pods scaled to 0
 ```
 
-The SHA-anchored tag (`v1.2.2-a1b2c3d`) confirms you are pulling exactly the right image:
+Monitor via:
 ```bash
-kubectl set image deployment/nginx-stable \
+kubectl argo rollouts get rollout nginx -n prod --watch
+```
+
+---
+
+### Scenario 2 — Manual abort during canary (human decision)
+
+Rollout is progressing but you want to abort based on non-metric signals (e.g. customer reports, log anomalies).
+
+```bash
+kubectl argo rollouts abort nginx -n prod
+```
+
+Argo Rollouts immediately sets VirtualService canary weight to 0% and scales canary pods down. Stable is unaffected.
+
+---
+
+### Scenario 3 — Issue detected after full promotion
+
+The rollout completed and all traffic serves the new (bad) image. Roll back to the previous known-good version using the SHA-anchored tag for precision.
+
+```bash
+# Use semver tag
+kubectl argo rollouts undo nginx -n prod
+
+# OR pin to exact SHA-anchored image
+kubectl argo rollouts set image nginx \
   nginx=ghcr.io/<owner>/nginx-app:v1.2.2-a1b2c3d \
   -n prod
 ```
 
+`undo` re-runs the full canary progression with the previous stable image — it does not skip analysis steps.
+
 ---
 
-### Scenario 3 — Emergency: automated rollback via GitHub Actions
+### Scenario 4 — Emergency bypass (break-glass)
 
-The prod workflow can trigger a rollback job on failure. It reads the last successful release tag from the GitHub API and re-deploys it:
+Argo Rollouts is unavailable or unresponsive. Force an immediate image swap directly on the underlying ReplicaSet.
 
-```yaml
-rollback:
-  if: failure()
-  runs-on: ubuntu-latest
-  steps:
-    - name: Get last stable release
-      id: prev
-      run: |
-        TAG=$(gh release list --limit 2 --json tagName -q '.[1].tagName')
-        echo "tag=$TAG" >> $GITHUB_OUTPUT
+```bash
+PREVIOUS=v1.2.2
+kubectl set image deployment/nginx \
+  nginx=ghcr.io/<owner>/nginx-app:${PREVIOUS} \
+  -n prod --record
 
-    - name: Roll back deployment
-      run: |
-        kubectl set image deployment/nginx-stable \
-          nginx=ghcr.io/${{ github.repository }}:${{ steps.prev.outputs.tag }} \
-          -n prod
+kubectl rollout status deployment/nginx -n prod
 ```
+
+> Use this only as a last resort — it bypasses Argo Rollouts state and requires a subsequent `kubectl argo rollouts sync` to reconcile.
 
 ---
 
 ### Rollback Decision Matrix
 
-| When detected | Action | Command |
-|---------------|--------|---------|
-| Canary still live | Delete canary deployment | `kubectl delete deployment nginx-canary -n prod` |
-| After full promotion | `kubectl set image` to previous semver | `kubectl set image deployment/nginx-stable nginx=...:v1.2.2 -n prod` |
-| Automated (CI failure) | GitHub Actions rollback job | Triggered automatically on workflow failure |
+| Scenario | Trigger | Action | Automated? |
+|---|---|---|---|
+| SLO breach at canary step | AnalysisRun failure | Argo Rollouts aborts, resets weights | **Yes** |
+| Human abort during canary | Operator decision | `kubectl argo rollouts abort nginx -n prod` | No |
+| Bad full promotion | Post-deploy issue | `kubectl argo rollouts undo nginx -n prod` | No |
+| Break-glass emergency | Rollouts unavailable | `kubectl set image` directly | No |
 
-> **Tip:** Always verify the rollback with `kubectl rollout status` and confirm the running image with:
+> **Tip:** Always confirm the running image after any rollback:
 > ```bash
+> kubectl argo rollouts get rollout nginx -n prod
 > kubectl get pods -n prod -o jsonpath='{.items[*].spec.containers[*].image}'
 > ```
 
@@ -350,21 +365,34 @@ rollback:
 .
 ├── .github/
 │   └── workflows/
-│       ├── dev.yml          # Build & deploy to dev on push to main
-│       ├── qa.yml           # Deploy to qa on PR merge or manual trigger
-│       └── prod.yml         # Canary release to prod on semver tag push
+│       ├── dev.yml               # Build & deploy to dev on push to main
+│       ├── qa.yml                # Deploy to qa on PR merge or manual trigger
+│       └── prod.yml              # Tag push → build → trigger Argo Rollouts canary
 ├── k8s/
 │   ├── dev/
+│   │   ├── namespace.yaml
 │   │   └── deployment.yaml
 │   ├── qa/
+│   │   ├── namespace.yaml
 │   │   └── deployment.yaml
 │   └── prod/
-│       ├── deployment-stable.yaml
-│       ├── deployment-canary.yaml
-│       └── service.yaml
+│       ├── namespace.yaml
+│       ├── service.yaml
+│       ├── rollout.yaml               # Argo Rollouts Rollout resource (replaces Deployment)
+│       ├── analysis-template.yaml     # Prometheus SLO gate (error rate + p99)
+│       └── istio/
+│           ├── gateway.yaml           # Istio IngressGateway
+│           ├── virtual-service.yaml   # Managed by Argo Rollouts (weights updated per step)
+│           └── destination-rule.yaml  # stable / canary subsets
 ├── nginx/
 │   ├── Dockerfile
-│   └── default.conf
+│   ├── default.conf          # stable — serves "stable" response
+│   └── canary.conf           # canary — serves "canary v<version>" response
+├── scripts/
+│   ├── setup-clusters.sh     # Creates dev/qa/prod K3d clusters with correct flags
+│   ├── install-istio.sh      # Installs Istio minimal profile on prod
+│   ├── install-argo.sh       # Installs Argo Rollouts controller + kubectl plugin
+│   └── promote-canary.sh     # Manual promotion helper (wraps kubectl argo rollouts)
 └── readme.md
 ```
 
@@ -375,6 +403,9 @@ rollback:
 - [Colima](https://github.com/abiosoft/colima) — `brew install colima`
 - [K3d](https://k3d.io) — `brew install k3d`
 - [kubectl](https://kubernetes.io/docs/tasks/tools/) — `brew install kubectl`
+- [Helm](https://helm.sh) — `brew install helm`
+- [istioctl](https://istio.io/latest/docs/setup/getting-started/) — `brew install istioctl`
+- [Argo Rollouts kubectl plugin](https://argoproj.github.io/argo-rollouts/) — `brew install argoproj/tap/kubectl-argo-rollouts`
 - [Docker](https://www.docker.com/) — required by Colima
 - GitHub account with Actions enabled and a container registry (GHCR)
 
@@ -401,13 +432,46 @@ k3d cluster create qa \
   --servers 1 --agents 1 \
   --port "8081:80@loadbalancer"
 
-# Prod — 1 server + 2 agents (supports stable + canary side by side)
+# Prod — Traefik disabled (Istio IngressGateway takes port 80)
 k3d cluster create prod \
   --servers 1 --agents 2 \
-  --port "8082:80@loadbalancer"
+  --port "8082:80@loadbalancer" \
+  --k3s-arg "--disable=traefik@server:0"
 ```
 
-### 3. Switch Context
+### 3. Install Istio on Prod
+
+```bash
+kubectl config use-context k3d-prod
+
+# Install Istio minimal profile
+istioctl install --set profile=minimal -y
+
+# Enable sidecar injection for prod namespace
+kubectl label namespace prod istio-injection=enabled
+```
+
+### 4. Install Argo Rollouts on Prod
+
+```bash
+kubectl create namespace argo-rollouts
+kubectl apply -n argo-rollouts \
+  -f https://github.com/argoproj/argo-rollouts/releases/latest/download/install.yaml
+```
+
+### 5. Install Prometheus (kube-prometheus-stack) on Prod
+
+```bash
+helm repo add prometheus-community https://prometheus-community.github.io/helm-charts
+helm repo update
+
+helm install prometheus prometheus-community/kube-prometheus-stack \
+  --namespace monitoring --create-namespace \
+  --set grafana.enabled=true \
+  --set prometheus.prometheusSpec.serviceMonitorSelectorNilUsesHelmValues=false
+```
+
+### 6. Switch Context
 
 ```bash
 kubectl config use-context k3d-dev
@@ -417,21 +481,44 @@ kubectl config use-context k3d-dev
 
 ## CI/CD Pipeline
 
-| Trigger | Workflow | Target |
-|---------|----------|--------|
-| Push to `main` | `dev.yml` | dev cluster |
-| PR merged to `main` | `qa.yml` | qa cluster |
-| Git tag `v*.*.*` pushed | `prod.yml` | prod cluster (canary) |
+| Trigger | Workflow | Target | Mechanism |
+|---------|----------|--------|-----------|
+| Push to `main` | `dev.yml` | dev cluster | `kubectl apply` |
+| PR merged to `main` | `qa.yml` | qa cluster | `kubectl apply` |
+| Git tag `v*.*.*` pushed | `prod.yml` | prod cluster | Argo Rollouts canary |
 
 ---
 
 ## Canary Rollout via GitHub Actions
 
-The production workflow:
-1. Builds and pushes the image tagged with the semver release
-2. Deploys the canary Kubernetes manifest (reduced replica count, traffic split via labels)
-3. Waits for a configurable stabilization period
-4. Promotes to full rollout or triggers rollback on failure
+The production workflow triggered on `v*.*.*` tag push:
+
+1. **Build** — Docker image built and pushed with dual tags (`v1.2.3` + `v1.2.3-<sha>`)
+2. **Update Rollout** — `kubectl argo rollouts set image` updates the image in the `Rollout` resource
+3. **Argo Rollouts takes over** — automatically progresses through canary steps:
+
+```
+Step 1: canary weight = 10%  │ pause 1m │ AnalysisRun: query Prometheus
+Step 2: canary weight = 30%  │ pause 2m │ AnalysisRun: query Prometheus
+Step 3: canary weight = 60%  │ pause 2m │ AnalysisRun: query Prometheus
+Step 4: promote → weight = 100% (stable fully replaced)
+```
+
+4. **AnalysisTemplate gates** — at each step, Prometheus is queried for:
+   - `nginx_http_requests_total{status=~"5.."}` error rate < 1%
+   - `nginx_request_duration_seconds` p99 < 500 ms
+5. **On gate failure** — Argo Rollouts automatically aborts, resets VirtualService weights to stable=100%
+6. **On success** — stable fully promoted, canary pods scaled to 0
+
+```yaml
+# GitHub Actions prod.yml (simplified)
+- name: Trigger canary rollout
+  run: |
+    kubectl argo rollouts set image nginx \
+      nginx=ghcr.io/${{ github.repository }}:${{ github.ref_name }} \
+      -n prod
+    kubectl argo rollouts status nginx -n prod --timeout 10m
+```
 
 ---
 
@@ -443,13 +530,17 @@ This project is a local learning environment. The table below maps each limitati
 
 | This project | Enterprise equivalent |
 |---|---|
-| Canary traffic split via replica ratio (1:3 = 25%) — crude, not percentage-based | Weighted routing at the proxy layer via **Argo Rollouts** or **Flagger** + **Istio / Linkerd** — precise `5% → 20% → 50% → 100%` steps independent of replica count |
+| **Argo Rollouts + Istio VirtualService** — exact % independent of replica count; 10% → 30% → 60% → 100% steps | Same stack at scale on managed Kubernetes (EKS/GKE/AKS) with Flagger as an alternative controller |
+
+> Traffic splitting is **fully addressed** in this project via Argo Rollouts + Istio.
 
 ### Promotion & Rollback
 
 | This project | Enterprise equivalent |
 |---|---|
-| Manual rollback triggered by a human or on CI job failure | SLO-driven automatic promotion/rollback — **Flagger / Argo Rollouts** query Prometheus metrics (error rate, p99 latency) and roll back automatically if a threshold is breached |
+| **Automatic SLO-gated rollback** via Argo Rollouts AnalysisTemplate querying Prometheus | Same, but with richer metric sources (Datadog, New Relic, CloudWatch) and multi-cluster promotion gates |
+
+> Automated rollback is **fully addressed** in this project.
 
 ### GitOps & Drift Detection
 
@@ -473,7 +564,9 @@ This project is a local learning environment. The table below maps each limitati
 
 | This project | Enterprise equivalent |
 |---|---|
-| No metrics, logs, or traces; rollback decisions are manual | Full stack: **Prometheus + Grafana** for metrics, **Loki / ELK** for logs, **Jaeger / OpenTelemetry** for traces — all feeding into the automated promotion gate |
+| **Prometheus + Grafana** feed Argo Rollouts analysis gates; no log aggregation or tracing | Full stack: Prometheus + Grafana for metrics, **Loki / ELK** for logs, **Jaeger / OpenTelemetry** for traces |
+
+> Metrics-based observability is **partially addressed** — logs and traces remain a gap.
 
 ### Approval Gates
 
@@ -498,17 +591,19 @@ This project is a local learning environment. The table below maps each limitati
 ### Summary Gap Map
 
 ```
-Feature                  This Project          Enterprise Target
-─────────────────────────────────────────────────────────────────
-Traffic splitting        Replica ratio         Istio + Argo Rollouts
-Auto promotion/rollback  Manual / CI failure   SLO-based (Prometheus)
-GitOps                   kubectl apply         ArgoCD / Flux
-Secrets                  GitHub Actions vars   Vault + OIDC
-Image security           None                  Trivy + Cosign + OPA
-Observability            None                  Prometheus + Loki + OTEL
-Approval gates           None                  Environment protection rules
-Infrastructure           Local single-machine  Managed K8s multi-AZ
-Compliance               None                  OPA + audit logs
+Feature                  This Project                    Gap?   Enterprise Target
+──────────────────────────────────────────────────────────────────────────────────
+Traffic splitting        Istio + Argo Rollouts           ✅ None  Same at scale
+Auto promotion/rollback  SLO-gated (Prometheus)          ✅ None  Richer metric sources
+Observability (metrics)  Prometheus + Grafana            ✅ None  Same at scale
+GitOps / drift detect    kubectl apply (push-based)      ⚠️ Gap   ArgoCD / Flux
+Secrets                  GitHub Actions secrets          ⚠️ Gap   Vault + OIDC
+Image security           None                            ❌ Gap   Trivy + Cosign + OPA
+Observability (logs)     None                            ❌ Gap   Loki / ELK
+Observability (traces)   None                            ❌ Gap   Jaeger / OpenTelemetry
+Approval gates           None                            ❌ Gap   Environment protection rules
+Infrastructure           Local single-machine K3d        ❌ Gap   Managed K8s multi-AZ
+Compliance               None                            ❌ Gap   OPA + audit logs
 ```
 
 ---
