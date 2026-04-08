@@ -1,0 +1,162 @@
+{
+  "__inputs": [
+    {
+      "name": "DS_PROMETHEUS",
+      "label": "Prometheus",
+      "description": "",
+      "type": "datasource",
+      "pluginId": "prometheus",
+      "pluginName": "Prometheus"
+    }
+  ],
+  "__requires": [
+    { "type": "grafana", "id": "grafana", "name": "Grafana", "version": "10.0.0" },
+    { "type": "datasource", "id": "prometheus", "name": "Prometheus", "version": "1.0.0" },
+    { "type": "panel", "id": "timeseries", "name": "Time series", "version": "" },
+    { "type": "panel", "id": "gauge", "name": "Gauge", "version": "" },
+    { "type": "panel", "id": "stat", "name": "Stat", "version": "" }
+  ],
+  "title": "Nginx Canary Rollout",
+  "uid": "nginx-canary-rollout",
+  "description": "Monitors stable vs canary traffic split, error rates, and p99 latency during an Argo Rollouts progressive delivery.",
+  "tags": ["nginx", "canary", "argo-rollouts", "istio"],
+  "timezone": "browser",
+  "refresh": "10s",
+  "time": { "from": "now-30m", "to": "now" },
+  "panels": [
+    {
+      "id": 1,
+      "title": "Canary Traffic Weight %",
+      "type": "gauge",
+      "gridPos": { "x": 0, "y": 0, "w": 4, "h": 6 },
+      "fieldConfig": {
+        "defaults": {
+          "min": 0, "max": 100, "unit": "percent",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "yellow", "value": 10 },
+              { "color": "orange", "value": 60 }
+            ]
+          }
+        }
+      },
+      "targets": [
+        {
+          "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+          "expr": "sum(rate(istio_requests_total{destination_version=\"canary\",namespace=\"prod\"}[1m])) / sum(rate(istio_requests_total{namespace=\"prod\"}[1m])) * 100",
+          "legendFormat": "canary %"
+        }
+      ]
+    },
+    {
+      "id": 2,
+      "title": "HTTP 5xx Error Rate — Stable vs Canary",
+      "type": "timeseries",
+      "gridPos": { "x": 4, "y": 0, "w": 10, "h": 6 },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit",
+          "custom": { "lineWidth": 2 },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "red", "value": 0.01 }
+            ]
+          }
+        }
+      },
+      "targets": [
+        {
+          "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+          "expr": "sum(rate(nginx_http_requests_total{namespace=\"prod\",status=~\"5..\",version=\"stable\"}[2m])) / sum(rate(nginx_http_requests_total{namespace=\"prod\",version=\"stable\"}[2m]))",
+          "legendFormat": "stable error rate"
+        },
+        {
+          "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+          "expr": "sum(rate(nginx_http_requests_total{namespace=\"prod\",status=~\"5..\",version=\"canary\"}[2m])) / sum(rate(nginx_http_requests_total{namespace=\"prod\",version=\"canary\"}[2m]))",
+          "legendFormat": "canary error rate"
+        }
+      ],
+      "options": {
+        "legend": { "displayMode": "list", "placement": "bottom" },
+        "tooltip": { "mode": "multi" }
+      }
+    },
+    {
+      "id": 3,
+      "title": "p99 Latency — Stable vs Canary",
+      "type": "timeseries",
+      "gridPos": { "x": 14, "y": 0, "w": 10, "h": 6 },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "custom": { "lineWidth": 2 },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "red", "value": 0.5 }
+            ]
+          }
+        }
+      },
+      "targets": [
+        {
+          "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+          "expr": "histogram_quantile(0.99, sum(rate(nginx_request_duration_seconds_bucket{namespace=\"prod\",version=\"stable\"}[2m])) by (le))",
+          "legendFormat": "stable p99"
+        },
+        {
+          "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+          "expr": "histogram_quantile(0.99, sum(rate(nginx_request_duration_seconds_bucket{namespace=\"prod\",version=\"canary\"}[2m])) by (le))",
+          "legendFormat": "canary p99"
+        }
+      ]
+    },
+    {
+      "id": 4,
+      "title": "Request Rate — Stable vs Canary (req/s)",
+      "type": "timeseries",
+      "gridPos": { "x": 0, "y": 6, "w": 12, "h": 6 },
+      "fieldConfig": {
+        "defaults": { "unit": "reqps", "custom": { "lineWidth": 2 } }
+      },
+      "targets": [
+        {
+          "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+          "expr": "sum(rate(nginx_http_requests_total{namespace=\"prod\",version=\"stable\"}[1m]))",
+          "legendFormat": "stable rps"
+        },
+        {
+          "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+          "expr": "sum(rate(nginx_http_requests_total{namespace=\"prod\",version=\"canary\"}[1m]))",
+          "legendFormat": "canary rps"
+        }
+      ]
+    },
+    {
+      "id": 5,
+      "title": "Argo Rollout Step — Analysis Status",
+      "type": "stat",
+      "gridPos": { "x": 12, "y": 6, "w": 12, "h": 6 },
+      "fieldConfig": {
+        "defaults": {
+          "mappings": [
+            { "type": "value", "options": { "1": { "text": "Successful", "color": "green" } } },
+            { "type": "value", "options": { "0": { "text": "Failed / Aborted", "color": "red" } } }
+          ]
+        }
+      },
+      "targets": [
+        {
+          "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+          "expr": "argo_rollout_info{namespace=\"prod\",name=\"nginx\"}",
+          "legendFormat": "rollout phase"
+        }
+      ]
+    }
+  ]
+}
