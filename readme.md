@@ -344,12 +344,12 @@ kubectl rollout status deployment/nginx -n prod
 
 ### Rollback Decision Matrix
 
-| Scenario | Trigger | Action | Automated? |
-|---|---|---|---|
-| SLO breach at canary step | AnalysisRun failure | Argo Rollouts aborts, resets weights | **Yes** |
-| Human abort during canary | Operator decision | `kubectl argo rollouts abort nginx -n prod` | No |
-| Bad full promotion | Post-deploy issue | `kubectl argo rollouts undo nginx -n prod` | No |
-| Break-glass emergency | Rollouts unavailable | `kubectl set image` directly | No |
+| Scenario | Trigger | Action | Automated? | Locally Proven? |
+|---|---|---|---|---|
+| SLO breach at canary step | AnalysisRun failure | Argo Rollouts aborts, resets weights | **Yes** | **Yes** — Issue 6 triggered automatic rollback before `or vector(0)` fix; VirtualService reset to stable=100% with no human action |
+| Human abort during canary | Operator decision | `kubectl argo rollouts abort nginx -n prod` | No | Not tested; mechanism is straightforward |
+| Bad full promotion | Post-deploy issue | `kubectl argo rollouts undo nginx -n prod` | No | Not tested locally; SHA-anchored tags (`v1.1.0-<sha>`) require CI push — local test used plain version tags |
+| Break-glass emergency | Rollouts unavailable | `kubectl set image` directly | No | Not tested; last-resort only |
 
 > **Tip:** Always confirm the running image after any rollback:
 > ```bash
@@ -700,6 +700,119 @@ curl -H "x-canary: true" http://localhost:8082/
 
 # 7. Abort at any time (restores stable=100%)
 kubectl argo rollouts abort nginx -n prod
+```
+
+---
+
+## Local DNS Environment Testing — Issues & Resolutions
+
+After proving the canary rollout on prod, all three environments were wired up for local browser and CLI access via named hostnames (`dev.nginx.local`, `qa.nginx.local`, `prod.nginx.local`). The `/etc/hosts` entries were already in place (`127.0.0.1` for all three). This section documents the three additional issues uncovered during that phase.
+
+---
+
+### Issue 7 — K3s boot loop on dev and qa after repeated stop/start cycles
+
+**Symptom:** After stopping and restarting the dev and qa clusters several times, both entered an infinite K3s restart loop. Pods would not schedule; nodes reported `NotReady`.
+
+**Root cause:** K3s's internal state (etcd snapshots, TLS certs) becomes inconsistent after repeated unclean container stops from Colima's vz driver. The K3s process restarts continuously trying to reconcile corrupt state.
+
+**Resolution:** Full deletion of both clusters including Docker containers, networks, and volumes, followed by fresh recreation:
+
+```bash
+k3d cluster delete dev qa
+docker network prune -f
+k3d cluster create dev --servers 1 --port "8080:80@loadbalancer"
+k3d cluster create qa  --servers 1 --agents 1 --port "8081:80@loadbalancer"
+```
+
+Then rebuilt and re-imported the local image and reapplied the manifests to both.
+
+---
+
+### Issue 8 — `curl http://dev.nginx.local:8080/healthz` returns 404 (Traefik without Ingress)
+
+**Symptom:** After applying `k8s/dev/deployment.yaml` and `k8s/qa/deployment.yaml`, `curl http://dev.nginx.local:8080/healthz` returned `404` even though the nginx pods were `Running`.
+
+**Root cause:** K3d maps `--port "8080:80@loadbalancer"` to the K3d serverlb container, which forwards to K3s nodes on port 80. K3s ships with **Traefik** as the default ingress controller and Traefik listens on port 80 on the nodes. Without an `Ingress` resource, Traefik has no routing rule for the request and returns its own `404 page not found`.
+
+The nginx Service was initially type `ClusterIP`, which is correct for Ingress-backed workloads, but there was no `Ingress` object to register a rule with Traefik.
+
+**Resolution:** Changed the nginx Service to type `LoadBalancer` (minor improvement; not strictly required for Ingress), and created explicit Ingress resources for each namespace:
+
+`k8s/dev/ingress.yaml`:
+```yaml
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: nginx
+  namespace: dev
+spec:
+  rules:
+    - host: dev.nginx.local
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: nginx
+                port:
+                  number: 80
+```
+
+`k8s/qa/ingress.yaml` mirrors the same structure for `qa.nginx.local`.
+
+**Result:** `curl http://dev.nginx.local:8080/healthz` → `200 ok`. Same for qa on port 8081.
+
+**Key lesson:** In K3d, `--port "HOSTPORT:80@loadbalancer"` routes through Traefik by default. Any workload accessed this way needs a matching `Ingress` resource. Direct LoadBalancer access (via NodePort/klipper-lb) is also possible but not the idiomatic K3d path for named-host routing.
+
+---
+
+### Issue 9 — `curl http://prod.nginx.local:8082/healthz` times out (Istio IngressGateway not installed)
+
+**Symptom:** After the prod cluster was rebuilt and Istio installed, `curl http://prod.nginx.local:8082/healthz` timed out with no response. `kubectl get svc -n istio-system` showed only `istiod` — no `istio-ingressgateway` service.
+
+**Root cause:** `scripts/install-istio.sh` used `istioctl install --set profile=minimal`. The `minimal` profile installs only **istiod** (the Istio control plane). The **IngressGateway** — which is the actual proxy pod that handles inbound traffic — is part of the `default` profile and was never deployed. The `Gateway` CRD resource in `k8s/prod/istio/gateway.yaml` references `selector: istio: ingressgateway`, which matched no running pod.
+
+**Resolution:** Installed the IngressGateway component on top of the existing `minimal` install without reinstalling istiod:
+
+```bash
+istioctl install --context k3d-prod -y \
+  --set profile=minimal \
+  --set 'components.ingressGateways[0].enabled=true' \
+  --set 'components.ingressGateways[0].name=istio-ingressgateway'
+```
+
+The IngressGateway deployed as a `LoadBalancer` service with external IP `172.20.0.4` (Docker network IP). K3s's klipper-lb created a DaemonSet to expose it on the node, and K3d's serverlb forwarded host:8082 → node:80 → IngressGateway pod → nginx-stable Service.
+
+**Result:** `curl http://prod.nginx.local:8082/healthz` → `200 ok`.
+
+**Updated `scripts/install-istio.sh`** should use the combined install to avoid this in future runs:
+```bash
+istioctl install --set profile=minimal \
+  --set 'components.ingressGateways[0].enabled=true' \
+  --set 'components.ingressGateways[0].name=istio-ingressgateway' -y
+```
+
+---
+
+### Final Verified State — All Environments Live
+
+The following was verified on `2026-04-07` after all fixes were applied:
+
+| Environment | URL | Response | Version |
+|---|---|---|---|
+| dev | `http://dev.nginx.local:8080/healthz` | `200 ok` | v1.0.0 |
+| dev | `http://dev.nginx.local:8080/version` | `200 v1.0.0` | v1.0.0 |
+| qa | `http://qa.nginx.local:8081/healthz` | `200 ok` | v1.0.0 |
+| qa | `http://qa.nginx.local:8081/version` | `200 v1.0.0` | v1.0.0 |
+| prod | `http://prod.nginx.local:8082/healthz` | `200 ok` | v1.1.0 (post-canary) |
+| prod | `http://prod.nginx.local:8082/version` | `200 v1.1.0` | v1.1.0 (post-canary) |
+
+Traffic path per environment:
+```
+dev/qa:   Mac host → K3d serverlb → Traefik IngressController → nginx Service → pod
+prod:     Mac host → K3d serverlb → Istio IngressGateway → VirtualService → nginx-stable Service → pod
 ```
 
 ---

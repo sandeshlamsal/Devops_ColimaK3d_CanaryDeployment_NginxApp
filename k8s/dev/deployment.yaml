@@ -17,7 +17,8 @@ spec:
     spec:
       containers:
         - name: nginx
-          image: ghcr.io/sandeshlamsal/nginx-app:dev-latest  # replaced by CI with dev-<sha>
+          image: nginx-app:v1.0.0      # replaced by CI with dev-<sha>; local testing uses k3d image import
+          imagePullPolicy: Never
           ports:
             - containerPort: 80
           resources:
@@ -51,4 +52,4 @@ spec:
   ports:
     - port: 80
       targetPort: 80
-  type: ClusterIP
+  type: LoadBalancer

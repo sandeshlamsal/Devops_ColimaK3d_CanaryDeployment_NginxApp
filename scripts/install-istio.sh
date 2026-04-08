@@ -6,12 +6,15 @@ echo "==> Switching context to k3d-prod-cluster"
 kubectl config use-context k3d-prod-cluster
 
 echo ""
-echo "==> Installing Istio (minimal profile)"
-istioctl install --set profile=minimal -y
+echo "==> Installing Istio (minimal profile + IngressGateway)"
+istioctl install --set profile=minimal \
+  --set 'components.ingressGateways[0].enabled=true' \
+  --set 'components.ingressGateways[0].name=istio-ingressgateway' \
+  -y
 
 echo ""
 echo "==> Waiting for Istio ingress gateway to be ready"
-kubectl -n istio-system rollout status deployment/istio-ingressgateway --timeout=120s
+kubectl -n istio-system rollout status deployment/istio-ingressgateway --timeout=180s
 
 echo ""
 echo "==> Enabling sidecar injection on prod namespace"
