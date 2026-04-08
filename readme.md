@@ -522,6 +522,188 @@ Step 4: promote → weight = 100% (stable fully replaced)
 
 ---
 
+## End-to-End Canary Rollout — Proven Test Record
+
+This section documents the full local test run of the Argo Rollouts + Istio canary pipeline, including every issue encountered and how it was resolved.
+
+---
+
+### Environment
+
+| Component | Version / Detail |
+|---|---|
+| macOS | Darwin 24.4.0 (Intel) |
+| Colima | vz (Virtualization.Framework) driver |
+| K3d | v5.x |
+| K3s | v1.33.6+k3s1 |
+| Istio | minimal profile |
+| Argo Rollouts | latest (kubectl plugin installed) |
+| Prometheus | kube-prometheus-stack (Helm) |
+
+---
+
+### Issues Encountered & Resolutions
+
+#### Issue 1 — K3d context names inconsistent across sessions
+
+**Symptom:** Scripts used `k3d-prod` but the actual context written by K3d was `k3d-prod-cluster` (stale from a prior session), causing all `kubectl` commands to fail with `context not found`.
+
+**Root cause:** K3d writes contexts at cluster creation time. If a cluster is deleted and recreated, it may write a new context alongside a stale one already in `~/.kube/config`.
+
+**Resolution:** Deleted all stale `k3d-prod*` contexts explicitly, recreated the cluster from a fully clean state (containers + network + volume removed), and merged the fresh kubeconfig. Updated all scripts to use the correct context name `k3d-prod`.
+
+---
+
+#### Issue 2 — Colima vz driver does not forward Docker port bindings to Mac localhost
+
+**Symptom:** After recreating the prod cluster with `--api-port 6445`, `kubectl get nodes` returned `connection refused` on `127.0.0.1:6445`. The port was bound inside the Colima VM but not reachable from the Mac host.
+
+**Root cause:** Colima's `vz` (Virtualization.Framework) driver routes Docker port bindings through an SSH mux process. Ports are only forwarded to `localhost` if they are registered with the SSH mux at the time it was established. Clusters created after the mux session started, or with explicit `--api-port`, bypass this registration.
+
+**Resolution:**
+- Removed `--api-port` flag — let K3d assign a dynamic port that Colima registers automatically.
+- When Colima restarts, K3d clusters must be restarted (`k3d cluster start`) so their ports are re-registered with the new SSH mux session.
+- Added `scripts/restart-clusters.sh` to handle this automatically.
+
+---
+
+#### Issue 3 — K3d prod serverlb config corruption after Colima restart
+
+**Symptom:** `k3d cluster start prod` failed with: `error getting loadbalancer config from k3d-prod-serverlb: runtime failed to read loadbalancer config '/etc/confd/values.yaml'`.
+
+**Root cause:** When Colima stops, K3d's serverlb (nginx-based loadbalancer) container exits uncleanly, corrupting the in-container config file. This is a known K3d + Colima vz compatibility issue.
+
+**Resolution:** Full teardown of all prod containers, network, and volume (`docker rm -f`, `docker network rm`, `docker volume rm`) before recreating the cluster. Added this cleanup step to `scripts/teardown.sh`.
+
+---
+
+#### Issue 4 — Argo Rollouts: same Service for stable and canary rejected
+
+**Symptom:** Rollout immediately went `Degraded` with: `spec.strategy.stableService: Invalid value: "nginx": This rollout uses the same service for the stable and canary services, but two different services are required.`
+
+**Root cause:** Argo Rollouts with Istio integration requires two separate Kubernetes Services — one for stable traffic and one for canary traffic. The controller patches selectors on these Services at runtime to point to the correct ReplicaSet.
+
+**Resolution:** Split `service.yaml` into `nginx-stable` and `nginx-canary` Services. Updated `rollout.yaml` to reference both. Updated `virtual-service.yaml` to route between the two hosts. Updated `destination-rule.yaml` to create a DestinationRule per Service.
+
+---
+
+#### Issue 5 — VirtualService route name `primary` not found
+
+**Symptom:** After fixing the Services, Rollout still `Degraded` with: `Istio VirtualService has invalid HTTP routes. Error: HTTP Route 'primary' is not found in the defined Virtual Service.`
+
+**Root cause:** The Rollout spec referenced `routes: [primary]` but the VirtualService's weighted route block had no `name` field.
+
+**Resolution:** Added `name: primary` to the weighted route block in `virtual-service.yaml`. Deleted and reapplied the Rollout to force a fresh reconciliation (update alone was insufficient due to controller caching).
+
+---
+
+#### Issue 6 — AnalysisRun error: `reflect: slice index out of range`
+
+**Symptom:** The first AnalysisRun triggered automatic rollback immediately after promotion with: `Metric "error-rate" assessed Error due to consecutiveErrors (5) > consecutiveErrorLimit (4): "Error Message: reflect: slice index out of range"`.
+
+**Root cause:** When no traffic has flowed through nginx yet, the Prometheus query `sum(rate(...)) / sum(rate(...))` returns an empty result set (no time series). Argo Rollouts tries to index `result[0]` on an empty slice, causing a panic.
+
+**Resolution:** Appended `or vector(0)` to both Prometheus queries in `analysis-template.yaml`. This causes the query to return `0` when no data exists, satisfying the `< 0.01` success condition rather than erroring:
+
+```promql
+(
+  sum(rate(nginx_http_requests_total{...status=~"5.."}[2m]))
+  /
+  sum(rate(nginx_http_requests_total{...}[2m]))
+) or vector(0)
+```
+
+Also raised `failureLimit` from 1 to 2 to add a small tolerance buffer.
+
+---
+
+### Proven Canary Rollout Flow
+
+The following was executed and verified locally on `2026-04-07`:
+
+```
+stable: nginx-app:v1.0.0  (3 pods, revision 1)
+                │
+                │  kubectl argo rollouts set image nginx nginx=nginx-app:v1.1.0
+                ▼
+Step 1/9  weight=10%   canary pod: 1   stable pods: 3   AnalysisRun: ✔ Successful
+                │  promote
+                ▼
+Step 2/9  weight=10%   AnalysisRun .2.1: ✔ Successful (4/4 measurements passed)
+                │  promote --full
+                ▼
+Step 9/9  weight=100%  canary becomes stable   old pods: scaling down
+                │
+                ▼
+stable: nginx-app:v1.1.0  (3 pods, revision 2)  Status: ✔ Healthy
+```
+
+**VirtualService weight progression managed by Argo Rollouts:**
+
+```
+Before rollout:  stable=100%  canary=0%
+After step 1:    stable=90%   canary=10%
+After promote:   stable=70%   canary=30%   (skipped via --full in this test)
+After promote:   stable=40%   canary=60%   (skipped via --full in this test)
+After full:      stable=0%    canary=100%  → canary promoted to stable
+```
+
+**Rollback also proven** (Issue 6 triggered it automatically before the fix):
+- AnalysisRun failure → Argo Rollouts aborted canary → VirtualService reset to stable=100% → canary pods scaled to 0 — all without human intervention.
+
+---
+
+### Final Stack State (post-test)
+
+```
+Namespace         Component                Status
+─────────────────────────────────────────────────
+istio-system      istiod                   Running ✔
+argo-rollouts     argo-rollouts            Running ✔
+monitoring        prometheus               Running ✔
+monitoring        grafana                  Running ✔
+prod              nginx (Rollout)          Healthy ✔  v1.1.0 stable
+prod              nginx-stable (Service)   Active  ✔
+prod              nginx-canary (Service)   Active  ✔
+prod              nginx-exporter           Running ✔
+prod              VirtualService/nginx     Synced  ✔
+prod              DestinationRules         Synced  ✔
+prod              AnalysisTemplate         Ready   ✔
+```
+
+---
+
+### Reproducing the Test Locally
+
+```bash
+# 1. Build stable baseline
+docker build --build-arg BUILD_ENV=stable --build-arg APP_VERSION=v1.0.0 \
+  -t nginx-app:v1.0.0 nginx/
+k3d image import nginx-app:v1.0.0 --cluster prod
+
+# 2. Build canary
+docker build --build-arg BUILD_ENV=canary --build-arg APP_VERSION=v1.1.0 \
+  -t nginx-app:v1.1.0 nginx/
+k3d image import nginx-app:v1.1.0 --cluster prod
+
+# 3. Trigger canary rollout
+kubectl argo rollouts set image nginx nginx=nginx-app:v1.1.0 -n prod
+
+# 4. Watch live progression
+kubectl argo rollouts get rollout nginx -n prod --watch
+
+# 5. Promote step by step (or use --full to skip pauses)
+kubectl argo rollouts promote nginx -n prod
+
+# 6. Test header-based canary routing (bypasses weight, always hits canary)
+curl -H "x-canary: true" http://localhost:8082/
+
+# 7. Abort at any time (restores stable=100%)
+kubectl argo rollouts abort nginx -n prod
+```
+
+---
+
 ## Limitations & Enterprise Roadmap
 
 This project is a local learning environment. The table below maps each limitation to the enterprise-grade alternative.
