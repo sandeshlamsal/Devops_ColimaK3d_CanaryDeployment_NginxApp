@@ -303,6 +303,84 @@ The production workflow:
 
 ---
 
+## Limitations & Enterprise Roadmap
+
+This project is a local learning environment. The table below maps each limitation to the enterprise-grade alternative.
+
+### Traffic Splitting
+
+| This project | Enterprise equivalent |
+|---|---|
+| Canary traffic split via replica ratio (1:3 = 25%) — crude, not percentage-based | Weighted routing at the proxy layer via **Argo Rollouts** or **Flagger** + **Istio / Linkerd** — precise `5% → 20% → 50% → 100%` steps independent of replica count |
+
+### Promotion & Rollback
+
+| This project | Enterprise equivalent |
+|---|---|
+| Manual rollback triggered by a human or on CI job failure | SLO-driven automatic promotion/rollback — **Flagger / Argo Rollouts** query Prometheus metrics (error rate, p99 latency) and roll back automatically if a threshold is breached |
+
+### GitOps & Drift Detection
+
+| This project | Enterprise equivalent |
+|---|---|
+| Push-based `kubectl apply` in GitHub Actions — stateless, no drift detection | **ArgoCD** or **Flux** continuously reconcile cluster state against Git; out-of-band changes are detected and corrected automatically |
+
+### Secrets Management
+
+| This project | Enterprise equivalent |
+|---|---|
+| No secrets handling; credentials stored as GitHub Actions secrets | **HashiCorp Vault**, **AWS Secrets Manager**, or **External Secrets Operator** + Sealed Secrets; CI authenticates via OIDC Workload Identity — no long-lived credentials |
+
+### Image Security
+
+| This project | Enterprise equivalent |
+|---|---|
+| No image scanning or signing | **Trivy / Grype** scans block promotion on critical CVEs; images signed with **Cosign**; admission controllers (**OPA / Kyverno**) reject unsigned or non-compliant images |
+
+### Observability
+
+| This project | Enterprise equivalent |
+|---|---|
+| No metrics, logs, or traces; rollback decisions are manual | Full stack: **Prometheus + Grafana** for metrics, **Loki / ELK** for logs, **Jaeger / OpenTelemetry** for traces — all feeding into the automated promotion gate |
+
+### Approval Gates
+
+| This project | Enterprise equivalent |
+|---|---|
+| No human approval before production promotion | **GitHub Environment Protection Rules** or pipeline gates (Jenkins / Spinnaker) requiring named-owner sign-off before canary is promoted |
+
+### Infrastructure
+
+| This project | Enterprise equivalent |
+|---|---|
+| Single-machine Colima + K3d; no HA control plane, no real load balancer, no persistent storage, no multi-region | Managed Kubernetes (**EKS / GKE / AKS**) across availability zones; cloud load balancers; persistent storage classes; cross-region failover |
+
+### Compliance & Audit
+
+| This project | Enterprise equivalent |
+|---|---|
+| No audit trail or policy enforcement | Every deploy event feeds an audit log; change management integration (**ServiceNow / Jira**); policy-as-code via **OPA / Kyverno** gates deployments against compliance checks |
+
+---
+
+### Summary Gap Map
+
+```
+Feature                  This Project          Enterprise Target
+─────────────────────────────────────────────────────────────────
+Traffic splitting        Replica ratio         Istio + Argo Rollouts
+Auto promotion/rollback  Manual / CI failure   SLO-based (Prometheus)
+GitOps                   kubectl apply         ArgoCD / Flux
+Secrets                  GitHub Actions vars   Vault + OIDC
+Image security           None                  Trivy + Cosign + OPA
+Observability            None                  Prometheus + Loki + OTEL
+Approval gates           None                  Environment protection rules
+Infrastructure           Local single-machine  Managed K8s multi-AZ
+Compliance               None                  OPA + audit logs
+```
+
+---
+
 ## License
 
 MIT
